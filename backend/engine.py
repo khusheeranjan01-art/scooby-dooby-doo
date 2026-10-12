@@ -53,19 +53,104 @@ def ngrams(text, nmax=4):
 
 
 def parse_resume(raw):
+    """
+    Robustly parse a resume in ANY real-world format:
+    - Dataset format:  inline ' Skills ' / ' Experience ' / ' Summary ' with spaces
+    - Normal format:   'Skills:', 'SKILLS', section headers on their own line
+    - Plain text:      no sections at all
+    """
     raw = str(raw)
     lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
     title = norm(lines[0])[:80] if lines else ""
-    t = norm(raw)
-    i = t.rfind(" Skills ")
-    skills = t[i + 8:][:900] if i != -1 else ""
-    m = re.search(r"\bSummary (.*?)(?= (?:Highlights|Accomplishments|Experience|Education|Skills) )", t)
-    summary = m.group(1)[:700] if m else ""
-    j = t.find(" Experience ")
-    exp = t[j + 12:] if j != -1 else t
-    if i != -1 and j != -1 and i > j:
-        exp = t[j + 12:i]
-    return dict(title=title, skills=skills, summary=summary, exp=exp[:4000])
+
+    def _find_section_start(text, *names):
+        """Return index of content start for first matching section header (multiline)."""
+        for name in names:
+            pat = re.compile(
+                r"(?:^|\n)\s*" + name + r"\s*:?\s*\n",
+                re.IGNORECASE | re.MULTILINE
+            )
+            m = pat.search(text)
+            if m:
+                return m.end()
+        return -1
+
+    ALL_HDR = (
+        r"Skills?|Key Skills?|Technical Skills?|Core Competenc\w*|"
+        r"Summary|Professional Summary|Objective|Profile|"
+        r"Highlights?|Accomplishments?|"
+        r"Experience|Work Experience|Professional Experience|Employment History|"
+        r"Education|Academic|Qualification|Projects?|Certifications?|Awards?"
+    )
+    _HDR_PAT = re.compile(
+        r"(?:^|\n)\s*(?:" + ALL_HDR + r")\s*:?\s*\n",
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    def _extract_section(text, start):
+        """Extract content from start until next section header."""
+        if start == -1:
+            return ""
+        m = _HDR_PAT.search(text, start)
+        end = m.start() if m else len(text)
+        return text[start:end].strip()
+
+    # ── Try multiline structured parsing (real-world resumes) ─────────────────
+    skills_start  = _find_section_start(raw, r"Skills?", r"Key Skills?", r"Technical Skills?", r"Core Competenc\w*")
+    exp_start     = _find_section_start(raw, r"Experience", r"Work Experience", r"Professional Experience", r"Employment History")
+    sum_start     = _find_section_start(raw, r"Summary", r"Professional Summary", r"Objective", r"Profile")
+
+    skills_text  = _extract_section(raw, skills_start)
+    summary_text = _extract_section(raw, sum_start)
+    exp_text     = _extract_section(raw, exp_start)
+
+    # ── Fallback: try the original inline-flattened approach (dataset format) ─
+    t = norm(raw)  # single-line normalized text
+
+    if not skills_text:
+        si = -1
+        for pat in [" Skills ", " Skills: ", " SKILLS ", " SKILLS: ", " Key Skills "]:
+            idx = t.rfind(pat)
+            if idx != -1:
+                si = idx + len(pat)
+                break
+        if si == -1:
+            m2 = re.search(r"\bSkills\s*[:\-]\s*", t, re.IGNORECASE)
+            if m2:
+                si = m2.end()
+        if si != -1:
+            skills_text = t[si:][:900]
+
+    if not exp_text:
+        ei = -1
+        for pat in [" Experience ", " Experience: ", " EXPERIENCE "]:
+            idx = t.find(pat)
+            if idx != -1:
+                ei = idx + len(pat)
+                break
+        if ei != -1:
+            # stop at Skills if Skills comes after Experience
+            si_flat = max(t.rfind(" Skills "), t.rfind(" SKILLS "))
+            exp_end = si_flat if (si_flat != -1 and si_flat > ei) else len(t)
+            exp_text = t[ei:exp_end]
+        else:
+            exp_text = t  # whole text as experience fallback
+
+    if not summary_text:
+        sm = re.search(
+            r"\bSummary\s*:?\s*(.*?)(?=\s+(?:Highlights|Accomplishments|Experience|Education|Skills)\b)",
+            t, re.IGNORECASE
+        )
+        if sm:
+            summary_text = sm.group(1)[:700]
+
+    return dict(
+        title=title,
+        skills=skills_text[:900],
+        summary=summary_text[:700],
+        exp=exp_text[:4000]
+    )
+
 
 
 def build_text(r, use_title=True):
@@ -400,6 +485,18 @@ DOMAINS = [
 ]
 
 
+def check_skill_present(s: str, have_set: set, raw_lower: str) -> bool:
+    """Robust skill presence checking with strict word-boundary checks for short tokens."""
+    s_clean = s.strip().lower()
+    if s_clean in have_set:
+        return True
+    # For short skills (<= 4 chars, e.g. 'r', 'c', 'sql', 'aws', 'git', 'pr', 'hr', 'ui', 'ux')
+    # or single-word skills without spaces: require word boundary \b to prevent matching inside other words!
+    if len(s_clean) <= 4 or " " not in s_clean:
+        return bool(re.search(r"\b" + re.escape(s_clean) + r"\b", raw_lower))
+    return bool(re.search(r"\b" + re.escape(s_clean) + r"\b", raw_lower)) or any(s_clean in h for h in have_set if len(h) >= len(s_clean))
+
+
 class Engine:
     def __init__(self):
         aux = joblib.load(ART / "_aux.joblib")
@@ -463,12 +560,8 @@ class Engine:
             cat_probs = [probs[self.classes.index(c)] for c in d["categories"] if c in self.classes]
             sem_val = max(cat_probs) if cat_probs else 0.05
 
-            # 2. Skill overlap
-            matched_skills = []
-            for s in d["skills"]:
-                if s in have_set or s in raw_lower or any(s in h for h in have_set):
-                    matched_skills.append(s)
-
+            # 2. Skill overlap with word boundary protection
+            matched_skills = [s for s in d["skills"] if check_skill_present(s, have_set, raw_lower)]
             missing_skills = [s for s in d["skills"] if s not in matched_skills]
             n_match = len(matched_skills)
             n_req = len(d["skills"])
@@ -481,9 +574,9 @@ class Engine:
             score = int(round((0.35 * min(sem_val * 4.0, 1.0) + 0.65 * cov_clamped) * 100))
             if n_match >= 4:
                 score = max(score, 78)
-            elif n_match >= 2:
-                score = max(score, 62)
-            elif n_match == 1:
+            elif n_match >= 2 and (sem_val >= 0.04 or n_match >= 3):
+                score = max(score, 60)
+            elif n_match == 1 and sem_val >= 0.08:
                 score = max(score, 45)
             score = min(98, max(12, score))
 
@@ -564,43 +657,88 @@ class Engine:
                         chosen_domain_meta = d
                         break
 
-        seen, matches = set(), []
-        
-        # If target domain chosen, boost/filter posts matching that domain's categories first
-        target_cats = set(chosen_domain_meta["categories"]) if chosen_domain_meta else set()
+        seen_pids, matches = set(), []
 
-        # Phase 1: If target domain specified, pull best posts from target categories
-        if target_cats:
-            for o in order:
-                pid = int(I[o])
+        # Target domains to source internships from:
+        if chosen_domain_meta:
+            domains_to_pull = [chosen_domain_meta]
+        else:
+            # Identify top compatible domains (score >= 40 and within 28 points of the top score)
+            top_dom_score = domain_compatibility[0]["score"] if domain_compatibility else 0
+            domains_to_pull = [
+                d for d in domain_compatibility
+                if (d["is_compatible"] or d["score"] >= 45) and d["score"] >= (top_dom_score - 28)
+            ]
+            if not domains_to_pull and domain_compatibility:
+                domains_to_pull = domain_compatibility[:1]
+
+        # Phase 1: From the top compatible domains, pull best matching postings
+        for dom in domains_to_pull:
+            dom_cats = set(dom["categories"])
+            cand_pids = [pid for pid in I if self.posts.iloc[pid]["category"] in dom_cats and pid not in seen_pids]
+            if not cand_pids:
+                cand_pids = [pid for pid in range(len(self.posts)) if self.posts.iloc[pid]["category"] in dom_cats and pid not in seen_pids]
+
+            for pid in cand_pids:
+                if len(matches) >= k:
+                    break
+                seen_pids.add(pid)
                 post = self.posts.iloc[pid]
-                if post["category"] in target_cats and post["category"] not in seen:
-                    seen.add(post["category"])
-                    g = self._gap(have_set, have_list, have_emb, post)
-                    
-                    # Adapt title to reflect the applicant's chosen target domain
-                    adapted_title = chosen_domain_meta["name"] + " Intern"
-                    matches.append(dict(
-                        pid=pid, title=adapted_title, category=str(post["category"]),
-                        confidence=round(max(float(probs[self.post_y[pid]]), chosen_domain_meta["score"] / 100.0), 4),
-                        similarity=round(float(S[o]), 3), **g))
-                    if len(matches) == k:
-                        break
+                g = self._gap(have_set, have_list, have_emb, post)
 
-        # Phase 2: Fill remaining slots with top overall matches
-        for o in order:
-            if len(matches) >= k:
-                break
-            pid = int(I[o])
-            post = self.posts.iloc[pid]
-            if post["category"] in seen:
-                continue
-            seen.add(post["category"])
-            g = self._gap(have_set, have_list, have_emb, post)
-            matches.append(dict(
-                pid=pid, title=str(post["title"]), category=str(post["category"]),
-                confidence=round(float(probs[self.post_y[pid]]), 4),
-                similarity=round(float(S[o]), 3), **g))
+                post_title = dom.get("postings_title") or (dom["name"] + " Intern")
+                faiss_idx = np.where(I == pid)[0]
+                sim_val = float(S[faiss_idx[0]]) if len(faiss_idx) > 0 else 0.45
+
+                matches.append(dict(
+                    pid=pid,
+                    title=post_title,
+                    category=str(post["category"]),
+                    confidence=round(dom["score"] / 100.0, 4),
+                    similarity=round(sim_val, 3),
+                    **g
+                ))
+                # When multiple distinct compatible domains exist, pick 1 per domain first
+                if len(domains_to_pull) > 1 and len(matches) < k:
+                    break
+
+        # Phase 2: If slots still remain (e.g. single domain like Chef), pull more postings from the same top domain
+        if len(matches) < k and domains_to_pull:
+            top_dom = domains_to_pull[0]
+            top_cats = set(top_dom["categories"])
+            remaining_pids = [pid for pid in I if self.posts.iloc[pid]["category"] in top_cats and pid not in seen_pids]
+            if not remaining_pids:
+                remaining_pids = [pid for pid in range(len(self.posts)) if self.posts.iloc[pid]["category"] in top_cats and pid not in seen_pids]
+            for pid in remaining_pids:
+                if len(matches) >= k:
+                    break
+                seen_pids.add(pid)
+                post = self.posts.iloc[pid]
+                g = self._gap(have_set, have_list, have_emb, post)
+                faiss_idx = np.where(I == pid)[0]
+                sim_val = float(S[faiss_idx[0]]) if len(faiss_idx) > 0 else 0.45
+                post_title = top_dom.get("postings_title") or str(post["title"])
+                matches.append(dict(
+                    pid=pid,
+                    title=post_title,
+                    category=str(post["category"]),
+                    confidence=round(top_dom["score"] / 100.0, 4),
+                    similarity=round(sim_val, 3),
+                    **g
+                ))
+
+        # Differentiate titles if multiple matches share the same title
+        title_counts = {}
+        for m in matches:
+            base_t = m["title"]
+            title_counts[base_t] = title_counts.get(base_t, 0) + 1
+            if title_counts[base_t] > 1:
+                p_skills = self.posts.iloc[m["pid"]]["skills"]
+                focus = p_skills[0].title() if p_skills else f"Focus {title_counts[base_t]}"
+                m["title"] = f"{base_t} - {focus}"
+
+        # Sort matches by coverage and confidence
+        matches.sort(key=lambda m: -(m["coverage"] * 100 + m["confidence"] * 50))
 
         top = np.argsort(-probs)[:6]
         compatible_domains = [d for d in domain_compatibility if d["is_compatible"]]
@@ -718,11 +856,7 @@ class Engine:
         req_skills = list(dict.fromkeys(domain_skills + top_w_skills))[:20]
 
         raw_lower = raw.lower()
-        matched_skills = []
-        for s in req_skills:
-            if s in have_set or s in raw_lower or any(s in h for h in have_set):
-                matched_skills.append(s)
-
+        matched_skills = [s for s in req_skills if check_skill_present(s, have_set, raw_lower)]
         missing_skills = [s for s in req_skills if s not in matched_skills]
         n_match = len(matched_skills)
 
